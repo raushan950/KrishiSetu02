@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # KrishiSetu (कृषिसेतु)
 
 **Connecting Farmers to Better Markets.** An independent agricultural market intelligence and farmer-to-buyer trading application aligned with SIH26132.
@@ -127,3 +128,6 @@ See [docs/CHECK_RESULTS.md](docs/CHECK_RESULTS.md) for precise executed checks a
 ## 19 November 2026 — module-focused v4 engineering
 
 The latest work is described in **`docs/IMPLEMENTATION_V4.md`**. New source code includes: validated and monitored paginated mandi ingestion; recent per-market selling opportunities; a corrected full-sale inventory constraint; vehicle schedule and capacity protections; private shipment evidence/timeline; and chronological model selection/holdout metrics in forecasting. **The files are present and syntax/pure-unit checked, not yet end-to-end verified.** See `docs/TESTS_V4.md` and run the actual CI/staging gates.
+=======
+# KrishiSetu02
+>>>>>>> 726147fb7fc05c035976da7e7aecf16fd827864d
