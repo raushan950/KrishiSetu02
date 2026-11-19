@@ -1,0 +1,65 @@
+from django.db import migrations, models
+import django.db.models.deletion
+from django.db.models import Q
+
+class Migration(migrations.Migration):
+    dependencies=[('core','0002_price_alert_payments')]
+    operations=[
+        migrations.AddField(model_name='order',name='accepted_qtl',field=models.DecimalField(max_digits=14,decimal_places=3,default=0)),
+        migrations.AddField(model_name='order',name='cancelled_qtl',field=models.DecimalField(max_digits=14,decimal_places=3,default=0)),
+        migrations.AddField(model_name='order',name='returned_qtl',field=models.DecimalField(max_digits=14,decimal_places=3,default=0)),
+        migrations.AlterField(model_name='offer',name='status',field=models.CharField(max_length=12,default='PENDING',choices=[('PENDING','Pending'),('ACCEPTED','Accepted'),('REJECTED','Rejected'),('EXPIRED','Expired'),('SUPERSEDED','Superseded'),('WITHDRAWN','Withdrawn')])),
+        migrations.AlterField(model_name='order',name='status',field=models.CharField(max_length=24,default='CONFIRMED',choices=[('CONFIRMED','Confirmed'),('DISPATCHED','Dispatched'),('DELIVERED','Carrier reported delivered'),('PARTIALLY_FULFILLED','Partially buyer accepted'),('CANCELLED','Cancelled'),('DISPUTED','Disputed'),('RETURNED','Returned')])),
+        migrations.AlterField(model_name='settlement',name='status',field=models.CharField(max_length=12,default='DECLARED',choices=[('DECLARED','Manual declaration'),('RECONCILED','Counterparty acknowledged manual declaration')])),
+        migrations.AddField(model_name='settlement',name='acknowledged_by',field=models.ForeignKey(to='core.user',related_name='acknowledged_settlements',on_delete=django.db.models.deletion.PROTECT,null=True,blank=True)),
+        migrations.AddField(model_name='settlement',name='acknowledged_at',field=models.DateTimeField(null=True,blank=True)),
+        migrations.CreateModel(name='DeliveryAcceptance',fields=[
+            ('id',models.BigAutoField(primary_key=True,serialize=False,auto_created=True,verbose_name='ID')),
+            ('quantity_qtl',models.DecimalField(max_digits=14,decimal_places=3)),
+            ('evidence_note',models.CharField(max_length=1000,blank=True)),
+            ('created_at',models.DateTimeField(auto_now_add=True)),
+            ('accepted_by',models.ForeignKey(on_delete=django.db.models.deletion.PROTECT,to='core.user')),
+            ('order',models.ForeignKey(to='core.order',related_name='acceptances',on_delete=django.db.models.deletion.PROTECT)),
+        ]),
+        migrations.AddConstraint(model_name='deliveryacceptance',constraint=models.CheckConstraint(condition=Q(quantity_qtl__gt=0),name='positive_delivery_acceptance')),
+        migrations.CreateModel(name='OrderChangeRequest',fields=[
+            ('id',models.BigAutoField(primary_key=True,serialize=False,auto_created=True,verbose_name='ID')),
+            ('kind',models.CharField(max_length=20,choices=[('CANCEL_REMAINDER','Cancel remaining quantity'),('RETURN','Return accepted produce')])),
+            ('quantity_qtl',models.DecimalField(max_digits=14,decimal_places=3)),
+            ('reason',models.CharField(max_length=1000)),
+            ('status',models.CharField(max_length=10,default='PROPOSED',choices=[('PROPOSED','Awaiting counterparty'),('APPROVED','Counterparty accepted'),('REJECTED','Counterparty rejected')])),
+            ('created_at',models.DateTimeField(auto_now_add=True)),
+            ('responded_at',models.DateTimeField(null=True,blank=True)),
+            ('order',models.ForeignKey(to='core.order',related_name='change_requests',on_delete=django.db.models.deletion.PROTECT)),
+            ('proposed_by',models.ForeignKey(to='core.user',related_name='proposed_changes',on_delete=django.db.models.deletion.PROTECT)),
+            ('responded_by',models.ForeignKey(to='core.user',related_name='reviewed_changes',on_delete=django.db.models.deletion.PROTECT,null=True,blank=True)),
+        ]),
+        migrations.AddConstraint(model_name='orderchangerequest',constraint=models.CheckConstraint(condition=Q(quantity_qtl__gt=0),name='positive_order_change_quantity')),
+        migrations.CreateModel(name='TradeDispute',fields=[
+            ('id',models.BigAutoField(primary_key=True,serialize=False,auto_created=True,verbose_name='ID')),
+            ('category',models.CharField(max_length=60)),
+            ('description',models.TextField()),
+            ('status',models.CharField(max_length=12,default='OPEN',choices=[('OPEN','Open'),('IN_REVIEW','In review'),('RESOLVED','Resolved'),('REJECTED','Rejected')])),
+            ('previous_order_status',models.CharField(max_length=24)),
+            ('resolution_note',models.TextField(blank=True)),
+            ('created_at',models.DateTimeField(auto_now_add=True)),
+            ('resolved_at',models.DateTimeField(null=True,blank=True)),
+            ('order',models.ForeignKey(to='core.order',related_name='disputes',on_delete=django.db.models.deletion.PROTECT)),
+            ('opened_by',models.ForeignKey(to='core.user',related_name='opened_disputes',on_delete=django.db.models.deletion.PROTECT)),
+            ('decided_by',models.ForeignKey(to='core.user',related_name='decided_disputes',on_delete=django.db.models.deletion.PROTECT,null=True,blank=True)),
+        ]),
+        migrations.CreateModel(name='RefundRequest',fields=[
+            ('id',models.BigAutoField(primary_key=True,serialize=False,auto_created=True,verbose_name='ID')),
+            ('amount_paise',models.PositiveBigIntegerField()),
+            ('reason',models.CharField(max_length=1000)),
+            ('status',models.CharField(max_length=20,default='REQUESTED',choices=[('REQUESTED','Awaiting administrator approval'),('PROVIDER_PENDING','Sent to payment provider'),('PROCESSED','Confirmed by signed provider webhook'),('REJECTED','Rejected by administrator'),('FAILED','Provider reported failure')])),
+            ('gateway_refund_id',models.CharField(max_length=100,unique=True,null=True,blank=True)),
+            ('created_at',models.DateTimeField(auto_now_add=True)),
+            ('updated_at',models.DateTimeField(auto_now=True)),
+            ('order',models.ForeignKey(to='core.order',related_name='refunds',on_delete=django.db.models.deletion.PROTECT)),
+            ('payment',models.ForeignKey(to='core.paymentattempt',related_name='refunds',on_delete=django.db.models.deletion.PROTECT)),
+            ('requested_by',models.ForeignKey(to='core.user',related_name='requested_refunds',on_delete=django.db.models.deletion.PROTECT)),
+            ('decided_by',models.ForeignKey(to='core.user',related_name='reviewed_refunds',on_delete=django.db.models.deletion.PROTECT,null=True,blank=True)),
+        ]),
+        migrations.AddConstraint(model_name='refundrequest',constraint=models.CheckConstraint(condition=Q(amount_paise__gt=0),name='positive_refund_amount')),
+    ]

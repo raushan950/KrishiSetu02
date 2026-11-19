@@ -1,0 +1,1 @@
+PASS: 38 standalone checks (calculations, forecasts, route manifest and config); NOT API execution

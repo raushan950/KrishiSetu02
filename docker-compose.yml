@@ -1,0 +1,61 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: krishisetu
+      POSTGRES_USER: krishi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U krishi -d krishisetu"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://krishi:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@db:5432/krishisetu
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,backend
+    volumes:
+      - media:/app/media
+      - shipment_private_evidence:/app/private_media
+    ports:
+      - '8000:8000'
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+  scheduler:
+    build: ./backend
+    profiles: ["scheduled-ingestion"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://krishi:${POSTGRES_PASSWORD:?Set_POSTGRES_PASSWORD_in_.env}@db:5432/krishisetu
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,scheduler
+    command: ["sh", "-c", "while true; do python manage.py ingest_and_alert; python manage.py expire_offers; sleep 86400; done"]
+    depends_on:
+      db:
+        condition: service_healthy
+    # Start only with --profile scheduled-ingestion after validating OGD credentials and source terms.
+  frontend:
+    build: ./frontend
+    volumes:
+      - media:/usr/share/nginx/html/media:ro
+    ports:
+      - '5173:80'
+    depends_on:
+      - backend
+volumes:
+  pgdata:
+  media:
+  shipment_private_evidence:

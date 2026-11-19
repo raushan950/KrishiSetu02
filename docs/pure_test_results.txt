@@ -1,0 +1,12 @@
+test_arrivals_require_known_unit (__main__.MarketParserTests.test_arrivals_require_known_unit) ... ok
+test_price_band_is_flagged_not_presented_as_valid (__main__.MarketParserTests.test_price_band_is_flagged_not_presented_as_valid) ... ok
+test_source_identity_is_case_whitespace_stable (__main__.MarketParserTests.test_source_identity_is_case_whitespace_stable) ... ok
+test_wrong_date_and_negative_are_rejected (__main__.MarketParserTests.test_wrong_date_and_negative_are_rejected) ... ok
+test_chronological_holdout (__main__.ProjectionTests.test_chronological_holdout) ... ok
+test_negative_net_return_is_preserved (__main__.ProjectionTests.test_negative_net_return_is_preserved) ... ok
+test_sparse_and_stale_are_unavailable (__main__.ProjectionTests.test_sparse_and_stale_are_unavailable) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.002s
+
+OK
