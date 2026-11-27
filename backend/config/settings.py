@@ -32,16 +32,31 @@ if not SECRET_KEY:
     else:
         from django.core.exceptions import ImproperlyConfigured
         raise ImproperlyConfigured('DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0')
+IS_VERCEL = os.getenv('VERCEL') == '1'
+VERCEL_HOSTS = [
+    os.getenv(k, '').strip()
+    for k in ('VERCEL_URL', 'VERCEL_BRANCH_URL', 'VERCEL_PROJECT_PRODUCTION_URL')
+    if os.getenv(k, '').strip()
+]
 ALLOWED_HOSTS = [h.strip() for h in os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if h.strip()]
 RENDER_EXTERNAL_HOSTNAME = os.getenv('RENDER_EXTERNAL_HOSTNAME', '').strip()
 if RENDER_EXTERNAL_HOSTNAME and RENDER_EXTERNAL_HOSTNAME not in ALLOWED_HOSTS:
     ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
+for _host in VERCEL_HOSTS:
+    if _host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_host)
+if IS_VERCEL and '.vercel.app' not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append('.vercel.app')
 
 CSRF_TRUSTED_ORIGINS = [x.strip() for x in os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',') if x.strip()]
 if RENDER_EXTERNAL_HOSTNAME:
     render_origin = f'https://{RENDER_EXTERNAL_HOSTNAME}'
     if render_origin not in CSRF_TRUSTED_ORIGINS:
         CSRF_TRUSTED_ORIGINS.append(render_origin)
+for _host in VERCEL_HOSTS:
+    _vercel_origin = f'https://{_host}'
+    if _vercel_origin not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(_vercel_origin)
 INSTALLED_APPS = [
     'django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes',
     'django.contrib.sessions', 'django.contrib.messages', 'django.contrib.staticfiles',
@@ -83,10 +98,14 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 LANGUAGE_CODE = 'en-in'; TIME_ZONE = 'Asia/Kolkata'; USE_I18N = True; USE_TZ = True
 STATIC_URL = '/static/'; STATIC_ROOT = BASE_DIR / 'staticfiles'
-MEDIA_URL = '/media/'; MEDIA_ROOT = BASE_DIR / 'media'
-PRIVATE_MEDIA_ROOT = BASE_DIR / 'private_media'  # not served by nginx /media
+MEDIA_URL = '/media/'; MEDIA_ROOT = Path('/tmp/krishisetu_media') if IS_VERCEL else (BASE_DIR / 'media')
+PRIVATE_MEDIA_ROOT = Path('/tmp/krishisetu_private_media') if IS_VERCEL else (BASE_DIR / 'private_media')  # not served by nginx /media
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOWED_ORIGINS = [o.strip() for o in os.getenv('CORS_ALLOWED_ORIGINS','http://localhost:5173').split(',') if o.strip()]
+for _host in VERCEL_HOSTS:
+    _vercel_origin = f'https://{_host}'
+    if _vercel_origin not in CORS_ALLOWED_ORIGINS:
+        CORS_ALLOWED_ORIGINS.append(_vercel_origin)
 _raw_cors_regexes = os.getenv(
     'CORS_ORIGIN_REGEXES',
     r'^https://krishisetu.*\.onrender\.com$,^https://krishisetu.*\.vercel\.app$' if not DEBUG else '',
@@ -136,7 +155,7 @@ OGD_IMPORT_PAGE_SIZE=int(os.getenv('OGD_IMPORT_PAGE_SIZE','500'))
 OGD_IMPORT_MAX_PAGES=int(os.getenv('OGD_IMPORT_MAX_PAGES','100'))
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 USE_X_FORWARDED_HOST = not DEBUG
-SECURE_SSL_REDIRECT = not DEBUG and os.getenv('SECURE_SSL_REDIRECT','1')=='1'
+SECURE_SSL_REDIRECT = not DEBUG and os.getenv('SECURE_SSL_REDIRECT', '0' if IS_VERCEL else '1') == '1'
 SESSION_COOKIE_SECURE=not DEBUG
 CSRF_COOKIE_SECURE=not DEBUG
 SECURE_HSTS_SECONDS=31536000 if not DEBUG else 0
@@ -191,7 +210,9 @@ STORAGES = {
     },
 }
 
-# Ensure local directories exist
-STATIC_ROOT.mkdir(parents=True, exist_ok=True)
-MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
-PRIVATE_MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+# Ensure local directories exist (serverless root is read-only at runtime)
+for _runtime_dir in (STATIC_ROOT, MEDIA_ROOT, PRIVATE_MEDIA_ROOT):
+    try:
+        _runtime_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
