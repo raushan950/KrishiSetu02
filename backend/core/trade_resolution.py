@@ -143,10 +143,10 @@ def order_change_respond(request,pk):
         if not change: raise NotFound()
         order=Order.objects.select_for_update().get(pk=change.order_id)
         participant(order,request.user)
-        if change.proposed_by_id==request.user.pk:
-            raise PermissionDenied('The other trading party must respond')
         if change.status!='PROPOSED' or order.status=='DISPUTED':
             raise ValidationError({'change':'Request is already processed or order is disputed'})
+        if change.proposed_by_id==request.user.pk:
+            raise PermissionDenied('The other trading party must respond')
         if decision=='APPROVE':
             if change.kind=='CANCEL_REMAINDER':
                 remain=order.quantity_qtl-order.accepted_qtl-order.cancelled_qtl
@@ -327,8 +327,13 @@ def acknowledge_manual_settlement(request,pk):
                      'notice':'Counterparty acknowledged the manual declaration; bank settlement not independently verified.'})
 
 
-@api_view(['PATCH','DELETE'])
+@api_view(['GET','PATCH','DELETE'])
 def listing_detail(request,pk):
+    if request.method=='GET':
+        from .serializers import ListingSerializer
+        listing=Listing.objects.select_related('crop').filter(pk=pk).first()
+        if not listing: raise NotFound()
+        return Response(ListingSerializer(listing,context={'request':request}).data)
     require_trade(request.user,'FARMER')
     with transaction.atomic():
         listing=Listing.objects.select_for_update().filter(pk=pk,farmer=request.user).first()
@@ -354,10 +359,36 @@ def listing_detail(request,pk):
 def admin_queue(request):
     require_role(request.user,'ADMIN')
     if not request.user.is_staff: raise PermissionDenied()
+    from .models import AuditEvent
+    submitted_events = AuditEvent.objects.filter(event='IDENTITY_VERIFICATION_SUBMITTED').order_by('-occurred_at')[:50]
+    pending_identity = []
+    seen_users = set()
+    for ev in submitted_events:
+        target_pk = ev.object_id
+        if target_pk not in seen_users:
+            seen_users.add(target_pk)
+            try:
+                pk_int = int(target_pk)
+            except (ValueError, TypeError):
+                continue
+            u = User.objects.filter(pk=pk_int, identity_verified=False).first()
+            if u:
+                pending_identity.append({
+                    'user_id': u.pk,
+                    'email': u.email,
+                    'role': u.role,
+                    'first_name': u.first_name,
+                    'district': u.district,
+                    'state': u.state,
+                    'document_type': (ev.details or {}).get('document_type', 'ID'),
+                    'masked_number': (ev.details or {}).get('masked_number', '****'),
+                    'submitted_at': ev.occurred_at
+                })
     return Response({
         'unverified_vehicles':VehicleSerializer(Vehicle.objects.filter(verified=False).order_by('id')[:100],many=True).data,
         'open_disputes':TradeDisputeSerializer(TradeDispute.objects.filter(status__in=['OPEN','IN_REVIEW']).order_by('id')[:100],many=True).data,
         'pending_refunds':RefundRequestSerializer(RefundRequest.objects.filter(status='REQUESTED').order_by('id')[:100],many=True).data,
+        'pending_identity_reviews': pending_identity,
     })
 
 
@@ -379,12 +410,21 @@ def admin_verify_vehicle(request,pk):
 def admin_verify_identity(request,pk):
     require_role(request.user,'ADMIN')
     if not request.user.is_staff: raise PermissionDenied()
-    if request.data.get('verified') is not True or len(str(request.data.get('evidence_note') or ''))<15:
-        raise ValidationError({'evidence_note':'Explicit approval and review evidence are required'})
+    verified = request.data.get('verified')
+    evidence_note = str(request.data.get('evidence_note') or '').strip()
+    if len(evidence_note) < 10:
+        raise ValidationError({'evidence_note':'Explicit review evidence or reason note required (min 10 characters)'})
     user=User.objects.filter(pk=pk,role__in=['FARMER','BUYER','TRANSPORTER']).first()
     if not user: raise NotFound()
-    user.identity_verified=True;user.save(update_fields=['identity_verified'])
-    # Minimal audit metadata: do not put government ID number into audit logs.
-    log(request.user,'ADMIN_IDENTITY_REVIEW_APPROVED',user.pk,review_recorded=True)
-    notify(user,'VERIFICATION','Your submitted identity review was approved; contact support for questions')
-    return Response({'user_id':user.pk,'identity_verified':True})
+    if verified in (True, 'True', 'true', '1', 1):
+        user.identity_verified=True
+        user.save(update_fields=['identity_verified'])
+        log(request.user,'ADMIN_IDENTITY_REVIEW_APPROVED',user.pk,review_recorded=True,note=evidence_note)
+        notify(user,'VERIFICATION',f'Your submitted identity review was approved: {evidence_note}')
+        return Response({'user_id':user.pk,'identity_verified':True,'status':'APPROVED'})
+    else:
+        user.identity_verified=False
+        user.save(update_fields=['identity_verified'])
+        log(request.user,'ADMIN_IDENTITY_REVIEW_REJECTED',user.pk,review_recorded=True,reason=evidence_note)
+        notify(user,'VERIFICATION',f'Your identity verification was rejected: {evidence_note}. Please update your details and resubmit.')
+        return Response({'user_id':user.pk,'identity_verified':False,'status':'REJECTED','reason':evidence_note})

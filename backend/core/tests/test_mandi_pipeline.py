@@ -37,7 +37,8 @@ class MandiImporterTests(TestCase):
         self.assertEqual(MandiPrice.objects.filter(quality_status='VALID').count(),2)
         self.assertTrue(all(p.source=='OGD/AGMARKNET' for p in MandiPrice.objects.all()))
         get.reset_mock()
-        get.return_value=Mock(**{'json.return_value':{'records':[a,b],'total':2}})
+        get.side_effect = None
+        get.return_value = Mock(**{'json.return_value': {'records': [a, b], 'total': 2}})
         call_command('import_ogd', limit=500)
         self.assertEqual(MarketImportRun.objects.latest('id').unchanged_count,2)
         self.assertEqual(MandiPrice.objects.count(),2)

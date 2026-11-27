@@ -34,7 +34,9 @@ class Command(BaseCommand):
             try:
                 response = requests.get(url,
                     params={'api-key': settings.OGD_API_KEY, 'format': 'json',
-                            'limit': limit, 'offset': offset}, timeout=25)
+                            'limit': limit, 'offset': offset},
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) KrishiSetu/5.1'},
+                    timeout=60)
                 response.raise_for_status()
                 return response.json()
             except (requests.RequestException, ValueError) as exc:

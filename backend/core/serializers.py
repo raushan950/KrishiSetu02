@@ -10,7 +10,17 @@ class UserSerializer(serializers.ModelSerializer):
         model=User
         fields=['id','email','phone','first_name','last_name','role','email_verified','phone_verified','account_verified','identity_verified','preferred_language','district','state']
         read_only_fields=['email','role','email_verified','phone_verified','account_verified','identity_verified']
-    def validate_phone(self,value): return normalize_phone(value) if value else None
+    def validate_phone(self, value):
+        if not value:
+            return None
+        normalized = normalize_phone(value)
+        user_pk = self.instance.pk if self.instance else None
+        query = User.objects.filter(phone=normalized)
+        if user_pk:
+            query = query.exclude(pk=user_pk)
+        if query.exists():
+            raise serializers.ValidationError("This mobile number cannot be used. Try another number or contact support.")
+        return normalized
     def update(self,instance,validated):
         if 'phone' in validated and validated['phone'] != instance.phone: instance.phone_verified=False
         if 'email' in validated and validated['email'] != instance.email: instance.email_verified=False
@@ -26,7 +36,7 @@ class RegisterSerializer(serializers.Serializer):
         return value
     def validate_phone(self,value):
         value=normalize_phone(value)
-        if User.objects.filter(phone=value).exists(): raise serializers.ValidationError('Phone is already registered')
+        if User.objects.filter(phone=value).exists(): raise serializers.ValidationError('This mobile number cannot be used. Try another number or contact support.')
         return value
     def validate_password(self,value):
         from django.contrib.auth.password_validation import validate_password
@@ -61,14 +71,27 @@ class MandiPriceSerializer(serializers.ModelSerializer):
         days=(timezone.localdate()-obj.observed_on).days
         return 'DATED' if days>2 else ('RECENT_OBSERVATION' if days>=0 else 'FUTURE_DATE_REVIEW')
 
+def _public_display_name(user, fallback_prefix):
+    """Return non-PII display label for trading counterparties (never expose email/phone)."""
+    if not user:
+        return fallback_prefix
+    full = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    return full if full else f"{fallback_prefix} #{user.pk}"
+
+
 class ListingSerializer(serializers.ModelSerializer):
     crop_name=serializers.CharField(source='crop.name',read_only=True)
     available_qtl=serializers.DecimalField(max_digits=14,decimal_places=3,read_only=True)
+    farmer_name=serializers.SerializerMethodField()
+    farmer_verified=serializers.BooleanField(source='farmer.account_verified',read_only=True)
+    farmer_identity_verified=serializers.BooleanField(source='farmer.identity_verified',read_only=True)
     class Meta:
         model=Listing
-        fields=['id','farmer','farm','crop','crop_name','variety','grade','quantity_qtl','reserved_qtl','available_qtl','asking_per_qtl',
+        fields=['id','farmer','farmer_name','farmer_verified','farmer_identity_verified','farm','crop','crop_name','variety','grade','quantity_qtl','reserved_qtl','available_qtl','asking_per_qtl',
                 'district','state','description','image','status','created_at']
-        read_only_fields=['farmer','reserved_qtl','status','created_at']
+        read_only_fields=['farmer','farmer_name','farmer_verified','farmer_identity_verified','reserved_qtl','status','created_at']
+    def get_farmer_name(self,obj):
+        return _public_display_name(getattr(obj,'farmer',None),'Farmer')
     def validate(self,attrs):
         if attrs.get('quantity_qtl', self.instance.quantity_qtl if self.instance else 0) <= 0:
             raise serializers.ValidationError({'quantity_qtl':'Quantity must be positive'})
@@ -79,27 +102,101 @@ class ListingSerializer(serializers.ModelSerializer):
         return attrs
 
 class OfferSerializer(serializers.ModelSerializer):
+    crop_name=serializers.CharField(source='listing.crop.name',read_only=True)
+    listing_variety=serializers.CharField(source='listing.variety',read_only=True)
+    listing_grade=serializers.CharField(source='listing.grade',read_only=True)
+    listing_district=serializers.CharField(source='listing.district',read_only=True)
+    listing_state=serializers.CharField(source='listing.state',read_only=True)
+    listing_asking_per_qtl=serializers.DecimalField(source='listing.asking_per_qtl',max_digits=13,decimal_places=2,read_only=True)
+    listing_available_qtl=serializers.DecimalField(source='listing.available_qtl',max_digits=14,decimal_places=3,read_only=True)
+    buyer_verified=serializers.BooleanField(source='buyer.account_verified',read_only=True)
+    buyer_identity_verified=serializers.BooleanField(source='buyer.identity_verified',read_only=True)
+    buyer_name=serializers.SerializerMethodField()
+    farmer_name=serializers.SerializerMethodField()
+    def get_buyer_name(self,obj):
+        return _public_display_name(getattr(obj,'buyer',None),'Buyer')
+    def get_farmer_name(self,obj):
+        listing=getattr(obj,'listing',None)
+        return _public_display_name(getattr(listing,'farmer',None),'Farmer')
     def validate(self,attrs):
         if attrs.get('quantity_qtl',0) <= 0 or attrs.get('price_per_qtl',0) <= 0:
             raise serializers.ValidationError('Offer quantity and price must be positive')
         return attrs
     class Meta:
         model=Offer
-        fields=['id','listing','buyer','proposed_by','parent','quantity_qtl','price_per_qtl','status','expires_at','created_at']
+        fields=['id','listing','crop_name','listing_variety','listing_grade','listing_district','listing_state',
+                'listing_asking_per_qtl','listing_available_qtl','buyer','buyer_name','buyer_verified','buyer_identity_verified',
+                'farmer_name','proposed_by','parent','quantity_qtl','price_per_qtl','status','expires_at','created_at']
         read_only_fields=['buyer','proposed_by','status','created_at']
 
 class OrderSerializer(serializers.ModelSerializer):
-    class Meta: model=Order; fields=['id','offer','listing','farmer','buyer','quantity_qtl','price_per_qtl','accepted_qtl','cancelled_qtl','returned_qtl','status','created_at','updated_at']
+    crop_name=serializers.CharField(source='listing.crop.name',read_only=True)
+    variety=serializers.CharField(source='listing.variety',read_only=True)
+    grade=serializers.CharField(source='listing.grade',read_only=True)
+    district=serializers.CharField(source='listing.district',read_only=True)
+    state=serializers.CharField(source='listing.state',read_only=True)
+    farmer_name=serializers.SerializerMethodField()
+    buyer_name=serializers.SerializerMethodField()
+    has_shipment=serializers.SerializerMethodField()
+    def get_farmer_name(self,obj):
+        return _public_display_name(getattr(obj,'farmer',None),'Farmer')
+    def get_buyer_name(self,obj):
+        return _public_display_name(getattr(obj,'buyer',None),'Buyer')
+    def get_has_shipment(self,obj):
+        return hasattr(obj,'shipment')
+    class Meta:
+        model=Order
+        fields=['id','offer','listing','crop_name','variety','grade','district','state',
+                'farmer','farmer_name','buyer','buyer_name','quantity_qtl','price_per_qtl',
+                'accepted_qtl','cancelled_qtl','returned_qtl','status','has_shipment','created_at','updated_at']
 class FreightRequestSerializer(serializers.ModelSerializer):
-    class Meta: model=FreightRequest; fields=['id','order','pickup_location','dropoff_location','pickup_date','created_at']; read_only_fields=['created_at']
+    crop_name=serializers.CharField(source='order.listing.crop.name',read_only=True)
+    order_quantity_qtl=serializers.DecimalField(source='order.quantity_qtl',max_digits=14,decimal_places=3,read_only=True)
+    order_status=serializers.CharField(source='order.status',read_only=True)
+    has_shipment=serializers.SerializerMethodField()
+    def get_has_shipment(self,obj):
+        return hasattr(obj.order,'shipment')
+    class Meta:
+        model=FreightRequest
+        fields=['id','order','crop_name','order_quantity_qtl','order_status','has_shipment','pickup_location','dropoff_location','pickup_date','created_at']
+        read_only_fields=['created_at']
 class VehicleSerializer(serializers.ModelSerializer):
     class Meta: model=Vehicle; fields=['id','transporter','registration','vehicle_type','capacity_qtl','verified']; read_only_fields=['transporter','verified']
 class FreightQuoteSerializer(serializers.ModelSerializer):
-    class Meta: model=FreightQuote; fields=['id','freight_request','transporter','vehicle','price_inr','message','created_at']; read_only_fields=['transporter','created_at']
+    vehicle_registration=serializers.CharField(source='vehicle.registration',read_only=True)
+    vehicle_type=serializers.CharField(source='vehicle.vehicle_type',read_only=True)
+    vehicle_capacity_qtl=serializers.DecimalField(source='vehicle.capacity_qtl',max_digits=12,decimal_places=2,read_only=True)
+    pickup_location=serializers.CharField(source='freight_request.pickup_location',read_only=True)
+    dropoff_location=serializers.CharField(source='freight_request.dropoff_location',read_only=True)
+    pickup_date=serializers.DateField(source='freight_request.pickup_date',read_only=True)
+    crop_name=serializers.CharField(source='freight_request.order.listing.crop.name',read_only=True)
+    order_quantity_qtl=serializers.DecimalField(source='freight_request.order.quantity_qtl',max_digits=14,decimal_places=3,read_only=True)
+    transporter_name=serializers.SerializerMethodField()
+    transporter_verified=serializers.BooleanField(source='transporter.account_verified',read_only=True)
+    is_assigned=serializers.SerializerMethodField()
+    def get_transporter_name(self,obj):
+        return _public_display_name(getattr(obj,'transporter',None),'Carrier')
+    def get_is_assigned(self,obj):
+        return hasattr(obj,'shipment')
+    class Meta:
+        model=FreightQuote
+        fields=['id','freight_request','transporter','transporter_name','transporter_verified','vehicle',
+                'vehicle_registration','vehicle_type','vehicle_capacity_qtl','pickup_location','dropoff_location',
+                'pickup_date','crop_name','order_quantity_qtl','is_assigned','price_inr','message','created_at']
+        read_only_fields=['transporter','created_at']
 class ShipmentSerializer(serializers.ModelSerializer):
+    pickup_location=serializers.CharField(source='quote.freight_request.pickup_location',read_only=True)
+    dropoff_location=serializers.CharField(source='quote.freight_request.dropoff_location',read_only=True)
+    pickup_date=serializers.DateField(source='quote.freight_request.pickup_date',read_only=True)
+    crop_name=serializers.CharField(source='order.listing.crop.name',read_only=True)
+    quantity_qtl=serializers.DecimalField(source='order.quantity_qtl',max_digits=14,decimal_places=3,read_only=True)
+    vehicle_registration=serializers.CharField(source='quote.vehicle.registration',read_only=True)
+    vehicle_type=serializers.CharField(source='quote.vehicle.vehicle_type',read_only=True)
+    freight_price_inr=serializers.DecimalField(source='quote.price_inr',max_digits=13,decimal_places=2,read_only=True)
     class Meta:
         model=Shipment
-        fields=['id','order','quote','status','evidence_note','updated_at']
+        fields=['id','order','quote','crop_name','quantity_qtl','pickup_location','dropoff_location','pickup_date',
+                'vehicle_registration','vehicle_type','freight_price_inr','status','evidence_note','updated_at']
         read_only_fields=['status','evidence_note','updated_at']
 
 class ShipmentEventSerializer(serializers.ModelSerializer):

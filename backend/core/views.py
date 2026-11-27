@@ -23,13 +23,15 @@ from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils.encoding import force_bytes
 from django.core.mail import send_mail
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
-from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.throttling import ScopedRateThrottle, AnonRateThrottle, UserRateThrottle
 from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework.exceptions import PermissionDenied, ValidationError, NotFound, Throttled
 from rest_framework_simplejwt.tokens import RefreshToken
 from google.oauth2 import id_token
@@ -40,13 +42,31 @@ from .calculations import net_return, dec
 from .models import (User, Farm, Crop, Market, MandiPrice, Listing, Offer, Order,
                      Vehicle, FreightRequest, FreightQuote, Shipment, Settlement,
                      Notification, AuditEvent, PriceAlert, PaymentAttempt, PaymentWebhookEvent, RefundRequest, ShipmentEvent)
-from .security import create_challenge, consume_challenge, normalize_phone
+from .security import create_challenge, consume_challenge, normalize_phone, mask_phone
 from .serializers import (UserSerializer,RegisterSerializer,FarmSerializer,CropSerializer,MarketSerializer,
     MandiPriceSerializer,ListingSerializer,OfferSerializer,OrderSerializer,VehicleSerializer,
     FreightRequestSerializer,FreightQuoteSerializer,ShipmentSerializer,SettlementSerializer,NotificationSerializer,ShipmentEventSerializer)
 
 
+class CatalogAnonRateThrottle(AnonRateThrottle):
+    """Generous rate throttle for public read-only agricultural catalog exploration."""
+    scope = 'catalog'
+
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    def validate(self, attrs):
+        # Normalize email/username: strip whitespace and lowercase for resilient auth
+        email = attrs.get(self.username_field, '')
+        if isinstance(email, str):
+            attrs[self.username_field] = email.strip().lower()
+        data = super().validate(attrs)
+        # Directly include serialized user object so frontend gets full session without extra roundtrip
+        data['user'] = UserSerializer(self.user).data
+        return data
+
+
 class ThrottledTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
     throttle_classes=[ScopedRateThrottle]
     throttle_scope='login'
 
@@ -82,37 +102,160 @@ def register(request):
     serializer=RegisterSerializer(data=request.data); serializer.is_valid(raise_exception=True)
     with transaction.atomic():
         user=serializer.save()
-        create_challenge(user,'EMAIL')
+        try:
+            create_challenge(user,'EMAIL')
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Initial verification send failed: %s", exc)
         log(user,'REGISTER',user.pk)
     return Response({'user':UserSerializer(user).data,'tokens':token_pair(user),
         'message':'Check your email for a single-use verification link. Verify phone separately.'},status=201)
 
 @api_view(['GET','PATCH'])
 def me(request):
-    if request.method=='GET': return Response(UserSerializer(request.user).data)
-    serializer=UserSerializer(request.user,data=request.data,partial=True)
+    if request.method == 'GET':
+        return Response(UserSerializer(request.user).data)
+    serializer = UserSerializer(request.user, data=request.data, partial=True)
     serializer.is_valid(raise_exception=True)
-    serializer.save()
-    log(request.user,'PROFILE_UPDATED',request.user.pk)
+    try:
+        with transaction.atomic():
+            serializer.save()
+    except IntegrityError as exc:
+        err_msg = str(exc)
+        if 'core_user_phone_key' in err_msg or 'phone' in err_msg.lower():
+            raise ValidationError({'phone': ['This mobile number cannot be used. Try another number or contact support.']})
+        if 'core_user_email_key' in err_msg or 'email' in err_msg.lower():
+            raise ValidationError({'email': ['This email address cannot be used. Try another email or contact support.']})
+        logger.exception("IntegrityError updating user profile: %s", exc)
+        raise ValidationError({'detail': 'Unable to save profile update due to a data conflict.'})
+    log(request.user, 'PROFILE_UPDATED', request.user.pk)
     return Response(serializer.data)
 
 @api_view(['POST'])
 def verification_request(request):
-    kind=request.data.get('kind')
-    if kind not in ('EMAIL','PHONE'): raise ValidationError({'kind':'EMAIL or PHONE required'})
-    if kind=='PHONE' and not request.user.phone: raise ValidationError({'phone':'Set phone number in your profile first'})
-    if kind=='EMAIL' and request.user.email_verified or kind=='PHONE' and request.user.phone_verified:
-        return Response({'message':'Already verified'})
-    challenge=create_challenge(request.user,kind)
-    return Response({'message':'Verification sent through configured provider','kind':kind, 'challenge_id':str(challenge.id)})
+    kind = request.data.get('kind')
+    if kind not in ('EMAIL', 'PHONE'):
+        raise ValidationError({'kind': 'EMAIL or PHONE required'})
+
+    pending_phone = None
+    if kind == 'PHONE':
+        phone_param = request.data.get('phone')
+        if phone_param:
+            pending_phone = normalize_phone(phone_param)
+            if User.objects.filter(phone=pending_phone).exclude(pk=request.user.pk).exists():
+                raise ValidationError({'phone': 'This mobile number cannot be used. Try another number or contact support.'})
+        elif not request.user.phone:
+            raise ValidationError({'phone': 'Please provide a valid Indian mobile number to verify.'})
+        else:
+            if request.user.phone_verified:
+                return Response({'message': 'Already verified', 'status': 'VERIFIED'})
+            if User.objects.filter(phone=request.user.phone).exclude(pk=request.user.pk).exists():
+                raise ValidationError({'phone': 'This mobile number cannot be used. Try another number or contact support.'})
+
+    if kind == 'EMAIL' and request.user.email_verified:
+        return Response({'message': 'Already verified', 'status': 'VERIFIED'})
+
+    challenge = create_challenge(request.user, kind, pending_phone=pending_phone)
+    target_display = pending_phone or (request.user.phone if kind == 'PHONE' else request.user.email)
+    provider = getattr(settings, 'SMS_PROVIDER', '').lower()
+    resp_data = {
+        'message': 'Verification sent through configured provider',
+        'kind': kind,
+        'challenge_id': str(challenge.id),
+        'target': mask_phone(target_display) if kind == 'PHONE' else target_display,
+        'pending_phone': pending_phone
+    }
+    if kind == 'PHONE' and (settings.DEBUG or provider in ('console', 'dev', 'dummy') or getattr(challenge, '_fallback_used', False)):
+        resp_data['dev_code'] = getattr(challenge, '_raw_code', None)
+    return Response(resp_data)
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def verification_confirm(request):
     kind=request.data.get('kind')
     if kind not in ('EMAIL','PHONE'): raise ValidationError({'kind':'EMAIL or PHONE required'})
-    consume_challenge(request.user,request.data.get('challenge_id'),request.data.get('token'),kind)
-    log(request.user,'VERIFIED_'+kind,request.user.pk)
-    return Response({'user':UserSerializer(request.user).data})
+    if kind == 'PHONE' and not request.user.is_authenticated:
+        raise ValidationError({'phone': 'Authentication required for phone verification'})
+    caller = request.user if request.user.is_authenticated else None
+    verified_user = consume_challenge(caller, request.data.get('challenge_id'), request.data.get('token'), kind)
+    log(verified_user, 'VERIFIED_'+kind, verified_user.pk)
+    return Response({'user': UserSerializer(verified_user).data, 'message': f'{kind.capitalize()} verification successful.'})
+
+@api_view(['GET', 'POST'])
+def identity_verification(request):
+    user = request.user
+    if request.method == 'GET':
+        if user.identity_verified:
+            return Response({
+                'status': 'VERIFIED',
+                'message': 'Government identity is verified by administrator.',
+                'verified': True
+            })
+
+        last_event = AuditEvent.objects.filter(
+            object_id=str(user.pk),
+            event__in=['IDENTITY_VERIFICATION_SUBMITTED', 'ADMIN_IDENTITY_REVIEW_APPROVED', 'ADMIN_IDENTITY_REVIEW_REJECTED']
+        ).order_by('-occurred_at').first()
+
+        if last_event and last_event.event == 'ADMIN_IDENTITY_REVIEW_REJECTED':
+            details = last_event.details or {}
+            return Response({
+                'status': 'REJECTED',
+                'message': 'Identity verification was reviewed and rejected.',
+                'reason': details.get('reason') or details.get('note') or 'Submitted documents did not meet requirements. Please resubmit clear documentation.',
+                'verified': False,
+                'reviewed_at': last_event.occurred_at
+            })
+        elif last_event and last_event.event == 'IDENTITY_VERIFICATION_SUBMITTED':
+            details = last_event.details or {}
+            return Response({
+                'status': 'PENDING_REVIEW',
+                'message': 'Identity documents are under administrator review.',
+                'document_type': details.get('document_type', 'Government ID'),
+                'masked_number': details.get('masked_number', '****'),
+                'submitted_at': last_event.occurred_at,
+                'verified': False
+            })
+
+        return Response({
+            'status': 'UNVERIFIED',
+            'message': 'Identity verification has not been submitted yet.',
+            'verified': False
+        })
+
+    # POST: submit identity documents
+    if user.identity_verified:
+        return Response({'status': 'VERIFIED', 'message': 'Account identity is already verified.', 'verified': True})
+
+    doc_type = str(request.data.get('document_type', '')).strip().upper()
+    valid_types = ['AADHAAR', 'PAN', 'KISAN_CREDIT_CARD', 'DRIVING_LICENSE', 'TRADE_LICENSE']
+    if doc_type not in valid_types:
+        raise ValidationError({'document_type': f'Document type must be one of: {", ".join(valid_types)}'})
+
+    doc_num = str(request.data.get('document_number', '')).strip()
+    if len(doc_num) < 6 or len(doc_num) > 25:
+        raise ValidationError({'document_number': 'Provide a valid document identifier (6 to 25 characters)'})
+
+    full_name = str(request.data.get('full_name', '')).strip()
+    if not full_name and not (user.first_name or user.last_name):
+        raise ValidationError({'full_name': 'Provide your full legal name as shown on the document'})
+
+    masked_number = ('*' * (len(doc_num) - 4)) + doc_num[-4:] if len(doc_num) >= 4 else '****'
+
+    log(user, 'IDENTITY_VERIFICATION_SUBMITTED', user.pk,
+        document_type=doc_type,
+        masked_number=masked_number,
+        full_name=full_name or f'{user.first_name} {user.last_name}'.strip())
+
+    notify(user, 'VERIFICATION', f'Your {doc_type} identity verification documents were submitted and are queued for administrator review.')
+
+    return Response({
+        'status': 'PENDING_REVIEW',
+        'message': 'Identity verification submitted successfully. Under administrator review.',
+        'document_type': doc_type,
+        'masked_number': masked_number,
+        'verified': False
+    })
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -125,7 +268,7 @@ def password_reset_request(request):
         uid=urlsafe_base64_encode(force_bytes(user.pk))
         token=default_token_generator.make_token(user)
         url=f'{settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}'
-        if settings.DEBUG or settings.EMAIL_HOST:
+        if (settings.DEBUG or settings.EMAIL_HOST) and not any(user.email.lower().endswith(d) for d in ('@krishisetu.in', '@example.com', '@test.local', '@test.com', '@dummy.com')):
             send_mail('Reset your KrishiSetu password',f'Reset link: {url}',settings.DEFAULT_FROM_EMAIL,[user.email],fail_silently=False)
     return Response({'message':'If the email is registered and delivery is configured, a reset link has been sent'})
 
@@ -178,30 +321,56 @@ def logout(request):
     return Response({'message':'Refresh token revoked. Discard access token locally.'})
 
 def verified_google_claim(credential):
-    if not settings.GOOGLE_CLIENT_ID: raise ValidationError({'google':'Google login is not configured'})
+    if not settings.GOOGLE_CLIENT_ID:
+        raise ValidationError({'google': 'Google login is not configured on this server. Please configure GOOGLE_CLIENT_ID.'})
+    if not credential:
+        raise ValidationError({'google': 'Missing Google ID token credential.'})
     try:
-        data=id_token.verify_oauth2_token(credential,google_requests.Request(),settings.GOOGLE_CLIENT_ID)
-    except Exception: raise ValidationError({'google':'Google credential could not be validated'})
-    if data.get('iss') not in ('accounts.google.com','https://accounts.google.com') or not data.get('email_verified'):
-        raise ValidationError({'google':'The Google email must be verified'})
-    if not data.get('sub') or not data.get('email'): raise ValidationError({'google':'Missing verified Google identity'})
+        data = id_token.verify_oauth2_token(credential, google_requests.Request(), settings.GOOGLE_CLIENT_ID)
+    except Exception as exc:
+        raise ValidationError({'google': f'Google credential could not be validated: {str(exc)}'})
+    if data.get('iss') not in ('accounts.google.com', 'https://accounts.google.com') or not data.get('email_verified'):
+        raise ValidationError({'google': 'The Google email must be verified by Google.'})
+    if not data.get('sub') or not data.get('email'):
+        raise ValidationError({'google': 'Missing verified Google identity information.'})
     return data
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def google_login(request):
-    claim=verified_google_claim(request.data.get('credential',''))
-    user=User.objects.filter(google_sub=claim['sub']).first()
+    claim = verified_google_claim(request.data.get('credential', ''))
+    user = User.objects.filter(google_sub=claim['sub']).first()
+    is_new_user = False
     if not user:
-        email=claim['email'].strip().lower()
+        email = claim['email'].strip().lower()
         if User.objects.filter(email__iexact=email).exists():
-            raise ValidationError({'google':'Account exists. Sign in with your password, then link Google in account settings.'})
-        user=User.objects.create_user(email=email,role='FARMER',email_verified=True,first_name=claim.get('given_name','')[:150])
-        user.set_unusable_password(); user.save(update_fields=['password'])
-        user.google_sub=claim['sub']; user.save(update_fields=['google_sub'])
-        log(user,'GOOGLE_ACCOUNT_CREATED',user.pk)
-    if not user.is_active: raise PermissionDenied('Account disabled')
-    return Response({'user':UserSerializer(user).data,'tokens':token_pair(user)})
+            raise ValidationError({'google': 'An account with this email already exists. Please sign in with your email/password, then link your Google account in Account Security.'})
+        role = (request.data.get('role') or 'FARMER').strip().upper()
+        if role not in ('FARMER', 'BUYER', 'TRANSPORTER'):
+            role = 'FARMER'
+        first_name = (claim.get('given_name') or claim.get('name') or '')[:150]
+        last_name = (claim.get('family_name') or '')[:150]
+        user = User.objects.create_user(
+            email=email,
+            role=role,
+            email_verified=True,
+            first_name=first_name,
+            last_name=last_name
+        )
+        user.set_unusable_password()
+        user.save(update_fields=['password'])
+        user.google_sub = claim['sub']
+        user.save(update_fields=['google_sub'])
+        log(user, 'GOOGLE_ACCOUNT_CREATED', user.pk)
+        is_new_user = True
+    if not user.is_active:
+        raise PermissionDenied('Account disabled.')
+    return Response({
+        'user': UserSerializer(user).data,
+        'tokens': token_pair(user),
+        'is_new_user': is_new_user,
+        'message': 'Welcome to KrishiSetu!' if is_new_user else 'Welcome back!'
+    })
 
 @api_view(['POST'])
 def google_link(request):
@@ -218,16 +387,32 @@ def google_link(request):
     return Response({'message':'Google account linked'})
 
 class Crops(ListAPIView):
-    permission_classes=[AllowAny]; queryset=Crop.objects.all().order_by('name'); serializer_class=CropSerializer
+    permission_classes = [AllowAny]
+    throttle_classes = [CatalogAnonRateThrottle, UserRateThrottle]
+    queryset = Crop.objects.all().order_by('name')
+    serializer_class = CropSerializer
+    pagination_class = None
+
 class Markets(ListAPIView):
-    permission_classes=[AllowAny]; serializer_class=MarketSerializer
+    permission_classes = [AllowAny]
+    throttle_classes = [CatalogAnonRateThrottle, UserRateThrottle]
+    serializer_class = MarketSerializer
+    pagination_class = None
     def get_queryset(self):
         qs=Market.objects.order_by('state','district','name')
         if self.request.query_params.get('district'): qs=qs.filter(district__icontains=self.request.query_params['district'])
         if self.request.query_params.get('state'): qs=qs.filter(state__icontains=self.request.query_params['state'])
         return qs
+class PricesPagination(PageNumberPagination):
+    page_size = 100
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
 class Prices(ListAPIView):
-    permission_classes=[AllowAny]; serializer_class=MandiPriceSerializer
+    permission_classes = [AllowAny]
+    throttle_classes = [CatalogAnonRateThrottle, UserRateThrottle]
+    serializer_class = MandiPriceSerializer
+    pagination_class = PricesPagination
     def get_queryset(self):
         qs=MandiPrice.objects.select_related('crop','market').filter(quality_status='VALID',observed_on__lte=timezone.localdate()).order_by('-observed_on','-id')
         for key,look in [('crop','crop_id'),('market','market_id')]:
@@ -236,11 +421,15 @@ class Prices(ListAPIView):
                 if not value.isdecimal(): raise ValidationError({key:'Numeric id required'})
                 qs=qs.filter(**{look:value})
         if self.request.query_params.get('state'): qs=qs.filter(market__state__icontains=self.request.query_params['state'])
+        if self.request.query_params.get('district'): qs=qs.filter(market__district__icontains=self.request.query_params['district'])
+        if self.request.query_params.get('variety'): qs=qs.filter(variety__icontains=self.request.query_params['variety'])
+        if self.request.query_params.get('grade'): qs=qs.filter(grade__iexact=self.request.query_params['grade'])
         if self.request.query_params.get('date_from'): qs=qs.filter(observed_on__gte=self.request.query_params['date_from'])
         return qs
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
+@throttle_classes([CatalogAnonRateThrottle, UserRateThrottle])
 def calculator(request):
     try:
         return Response(net_return(request.data.get('quantity_qtl'),request.data.get('price_per_qtl'),
@@ -249,6 +438,7 @@ def calculator(request):
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
+@throttle_classes([CatalogAnonRateThrottle, UserRateThrottle])
 def compare_destinations(request):
     """Rank only source-backed destinations with caller-provided cost assumptions."""
     try:
@@ -321,9 +511,11 @@ def validate_image(file):
 @permission_classes([AllowAny])
 def listings(request):
     if request.method=='GET':
-        qs=Listing.objects.select_related('crop').filter(status='ACTIVE',quantity_qtl__gt=F('reserved_qtl')).order_by('-created_at')
+        qs=Listing.objects.select_related('crop','farmer').filter(status='ACTIVE',quantity_qtl__gt=F('reserved_qtl')).order_by('-created_at')
         if request.query_params.get('crop'): qs=qs.filter(crop_id=request.query_params['crop'])
         if request.query_params.get('district'): qs=qs.filter(district__icontains=request.query_params['district'])
+        if request.query_params.get('state'): qs=qs.filter(state__icontains=request.query_params['state'])
+        if request.query_params.get('grade'): qs=qs.filter(grade__icontains=request.query_params['grade'])
         from rest_framework.pagination import PageNumberPagination
         pg=PageNumberPagination(); page=pg.paginate_queryset(qs,request)
         return pg.get_paginated_response(ListingSerializer(page,many=True,context={'request':request}).data)
@@ -336,12 +528,12 @@ def listings(request):
 @api_view(['GET'])
 def my_listings(request):
     require_role(request.user,'FARMER')
-    return Response(ListingSerializer(Listing.objects.filter(farmer=request.user).order_by('-created_at'),many=True,context={'request':request}).data)
+    return Response(ListingSerializer(Listing.objects.select_related('crop','farmer').filter(farmer=request.user).order_by('-created_at'),many=True,context={'request':request}).data)
 
 @api_view(['GET','POST'])
 def offers(request):
     if request.method=='GET':
-        qs=Offer.objects.select_related('listing').filter(Q(buyer=request.user)|Q(listing__farmer=request.user)).distinct().order_by('-created_at')
+        qs=Offer.objects.select_related('listing__crop','listing__farmer','buyer').filter(Q(buyer=request.user)|Q(listing__farmer=request.user)).distinct().order_by('-created_at')
         return Response(OfferSerializer(qs,many=True).data)
     require_trade(request.user,'BUYER')
     s=OfferSerializer(data=request.data); s.is_valid(raise_exception=True)
@@ -406,7 +598,7 @@ def accept_offer(request,pk):
 
 @api_view(['GET'])
 def orders(request):
-    qs=Order.objects.filter(Q(farmer=request.user)|Q(buyer=request.user)).order_by('-created_at')
+    qs=Order.objects.select_related('listing__crop','farmer','buyer','shipment').filter(Q(farmer=request.user)|Q(buyer=request.user)).order_by('-created_at')
     return Response(OrderSerializer(qs,many=True).data)
 
 @api_view(['POST'])
@@ -429,8 +621,9 @@ def vehicles(request):
 @api_view(['GET','POST'])
 def freight_requests(request):
     if request.method=='GET':
-        if request.user.role=='TRANSPORTER': qs=FreightRequest.objects.all()
-        else: qs=FreightRequest.objects.filter(Q(order__farmer=request.user)|Q(order__buyer=request.user))
+        base=FreightRequest.objects.select_related('order__listing__crop','order__shipment').order_by('-created_at')
+        if request.user.role=='TRANSPORTER': qs=base
+        else: qs=base.filter(Q(order__farmer=request.user)|Q(order__buyer=request.user))
         return Response(FreightRequestSerializer(qs,many=True).data)
     require_trade(request.user,'FARMER','BUYER')
     s=FreightRequestSerializer(data=request.data);s.is_valid(raise_exception=True)
@@ -448,9 +641,9 @@ def freight_requests(request):
 @api_view(['GET','POST'])
 def freight_quotes(request):
     if request.method=='GET':
-        qs=FreightQuote.objects.all() if request.user.role=='TRANSPORTER' else FreightQuote.objects.filter(
+        base=FreightQuote.objects.select_related('vehicle','transporter','freight_request__order__listing__crop','shipment').order_by('-created_at')
+        qs=base.filter(transporter=request.user) if request.user.role=='TRANSPORTER' else base.filter(
             Q(freight_request__order__farmer=request.user)|Q(freight_request__order__buyer=request.user))
-        if request.user.role=='TRANSPORTER': qs=qs.filter(transporter=request.user)
         return Response(FreightQuoteSerializer(qs,many=True).data)
     require_trade(request.user,'TRANSPORTER')
     s=FreightQuoteSerializer(data=request.data);s.is_valid(raise_exception=True)
@@ -459,7 +652,11 @@ def freight_quotes(request):
     if s.validated_data['price_inr']<=0: raise ValidationError({'price_inr':'Freight quote must be positive'})
     if vehicle.capacity_qtl<fr.order.quantity_qtl: raise ValidationError({'vehicle':'Insufficient vehicle capacity'})
     if fr.order.status!='CONFIRMED': raise ValidationError({'order':'Order unavailable'})
-    quote=s.save(transporter=request.user)
+    try:
+        with transaction.atomic():
+            quote=s.save(transporter=request.user)
+    except IntegrityError as exc:
+        raise ValidationError({'freight_request':'You have already submitted a freight quote for this request'}) from exc
     notify(fr.order.farmer,'FREIGHT_QUOTE',f'Freight quote received for order {fr.order_id}')
     log(request.user,'FREIGHT_QUOTED',quote.pk)
     return Response(FreightQuoteSerializer(quote).data,status=201)
@@ -495,7 +692,7 @@ def assign_quote(request,pk):
 
 @api_view(['GET'])
 def shipments(request):
-    qs=Shipment.objects.filter(Q(order__farmer=request.user)|Q(order__buyer=request.user)|Q(quote__transporter=request.user)).distinct()
+    qs=Shipment.objects.select_related('order__listing__crop','quote__freight_request','quote__vehicle').filter(Q(order__farmer=request.user)|Q(order__buyer=request.user)|Q(quote__transporter=request.user)).distinct().order_by('-updated_at')
     return Response(ShipmentSerializer(qs,many=True).data)
 
 

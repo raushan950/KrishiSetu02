@@ -1,0 +1,72 @@
+# Render.com 100% Free-of-Cost Full-Stack Blueprint ($0/month, no credit card required)
+# Connects KrishiSetu Backend (Python/Gunicorn) + Frontend (Vite Static Site) to Supabase Free PostgreSQL.
+
+services:
+  # 1. Django REST API Backend (Free Web Service)
+  - type: web
+    name: krishisetu-api
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: backend
+    buildCommand: "bash build.sh"
+    startCommand: "gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --threads 2 --timeout 90"
+    healthCheckPath: /health/
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: DJANGO_DEBUG
+        value: "0"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: SECURE_SSL_REDIRECT
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: FRONTEND_URL
+        value: "https://krishisetu-web.onrender.com"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: SMS_PROVIDER
+        value: ""
+      - key: FAST2SMS_API_KEY
+        sync: false
+      - key: OGD_API_KEY
+        sync: false
+      - key: OGD_RESOURCE_ID
+        sync: false
+
+  # 2. React / Vite Frontend (Free Static Site — Always-On Global CDN)
+  - type: web
+    name: krishisetu-web
+    runtime: static
+    plan: free
+    rootDir: frontend
+    buildCommand: "npm ci && npm run build"
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: VITE_API_HOST
+        fromService:
+          type: web
+          name: krishisetu-api
+          property: host
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: VITE_GOOGLE_CLIENT_ID
+        sync: false

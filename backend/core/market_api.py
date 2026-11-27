@@ -2,10 +2,15 @@
 from datetime import timedelta
 from django.db.models import Count, Max
 from django.utils import timezone
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
+
+
+class MarketSyncRateThrottle(AnonRateThrottle):
+    scope = 'market_sync'
 
 from .models import MandiPrice, MarketImportRun, Offer
 
@@ -48,6 +53,21 @@ def import_monitor(request):
         .values('id','source','observed_on','source_record_id','quality_flags','modal_price')[:30])
     return Response({'runs':latest,'flagged_samples':flagged,
         'note':'Flagged observations cannot appear in recommendations or forecasts.'})
+
+
+@api_view(['POST'])
+@throttle_classes([UserRateThrottle])
+def trigger_sync(request):
+    """Trigger background mandi data sync immediately (Administrator only)."""
+    if not request.user.is_authenticated or request.user.role != 'ADMIN' or not request.user.is_staff:
+        raise PermissionDenied('Administrator access required to synchronize live market feeds.')
+    from .scheduler import sync_now_in_background
+    started = sync_now_in_background()
+    return Response({
+        'status': 'SCHEDULED' if started else 'ALREADY_RUNNING',
+        'message': 'Mandi synchronization started in background.' if started else 'Mandi synchronization is already running.'
+    })
+
 
 
 MAX_MARKET_OPTIONS = 250

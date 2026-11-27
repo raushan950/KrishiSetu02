@@ -50,8 +50,9 @@ def email_change_request(request):
         challenge.save(update_fields=['digest'])
         url=settings.FRONTEND_URL+'/account?'+urlencode({'email_change_id':str(challenge.pk),'email_change_token':token})
         try:
-            send_mail('Confirm new KrishiSetu email',f'Open this single-use link (valid for 30 minutes): {url}',
-                settings.DEFAULT_FROM_EMAIL,[email],fail_silently=False)
+            if not any(email.lower().endswith(d) for d in ('@krishisetu.in', '@example.com', '@test.local', '@test.com', '@dummy.com')):
+                send_mail('Confirm new KrishiSetu email',f'Open this single-use link (valid for 30 minutes): {url}',
+                    settings.DEFAULT_FROM_EMAIL,[email],fail_silently=False)
         except Exception:
             raise ValidationError({'delivery':'Email could not be delivered; current address was not changed'})
         log(current,'EMAIL_CHANGE_REQUESTED',challenge.pk)
